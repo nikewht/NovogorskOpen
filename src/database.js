@@ -20,11 +20,38 @@ class Database {
         CREATE TABLE IF NOT EXISTS sessions (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           chat_id INTEGER NOT NULL,
+          game_mode TEXT DEFAULT 'short',
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           closed_at DATETIME,
           is_active BOOLEAN DEFAULT 1
         )
-      `);
+      `, (err) => {
+        if (err) {
+          console.error('Error creating sessions table:', err);
+          return;
+        }
+
+        // Миграция: добавляем game_mode если его нет
+        this.db.all(`PRAGMA table_info(sessions)`, (err, columns) => {
+          if (err) {
+            console.error('Error checking table schema:', err);
+            return;
+          }
+
+          const hasGameMode = columns.some(col => col.name === 'game_mode');
+
+          if (!hasGameMode) {
+            console.log('Running migration: adding game_mode column to sessions table');
+            this.db.run(`ALTER TABLE sessions ADD COLUMN game_mode TEXT DEFAULT 'short'`, (err) => {
+              if (err) {
+                console.error('Error adding game_mode column:', err);
+              } else {
+                console.log('Migration completed: game_mode column added');
+              }
+            });
+          }
+        });
+      });
 
       // Таблица игроков в сессии
       this.db.run(`
@@ -56,11 +83,11 @@ class Database {
   }
 
   // Создать новую сессию
-  createSession(chatId) {
+  createSession(chatId, gameMode = 'short') {
     return new Promise((resolve, reject) => {
       this.db.run(
-        'INSERT INTO sessions (chat_id, is_active) VALUES (?, 1)',
-        [chatId],
+        'INSERT INTO sessions (chat_id, game_mode, is_active) VALUES (?, ?, 1)',
+        [chatId, gameMode],
         function(err) {
           if (err) reject(err);
           else resolve(this.lastID);

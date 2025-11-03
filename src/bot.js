@@ -88,12 +88,20 @@ bot.onText(/\/newsession/, async (msg) => {
       return;
     }
 
-    const sessionId = await db.createSession(chatId);
-
+    // Показываем выбор режима игры
     bot.sendMessage(
       chatId,
-      `✅ Новая сессия создана! ID: ${sessionId}\n\n👥 Участники:\nПока никто не присоединился\n\nИспользуйте кнопки ниже или команды /join и /leave`,
-      { reply_markup: getSessionKeyboard() }
+      '🎾 Выберите режим игры:',
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '⚡ Короткий матч (до 2 побед в геймах)', callback_data: 'mode_short' }],
+            [{ text: '🎾 Классический сет (до 6 геймов)', callback_data: 'mode_set' }],
+            [{ text: '🏆 Матч из 2 сетов', callback_data: 'mode_2sets' }],
+            [{ text: '👑 Матч из 3 сетов', callback_data: 'mode_3sets' }]
+          ]
+        }
+      }
     );
   } catch (error) {
     console.error('Error creating session:', error);
@@ -245,8 +253,33 @@ bot.on('callback_query', async (query) => {
   const messageId = query.message.message_id;
 
   try {
+    // Выбор режима игры
+    if (data.startsWith('mode_')) {
+      const gameMode = data.replace('mode_', '');
+
+      const sessionId = await db.createSession(chatId, gameMode);
+
+      const modeNames = {
+        'short': '⚡ Короткий матч (до 2 побед в геймах)',
+        'set': '🎾 Классический сет (до 6 геймов)',
+        '2sets': '🏆 Матч из 2 сетов',
+        '3sets': '👑 Матч из 3 сетов'
+      };
+
+      bot.editMessageText(
+        `✅ Новая сессия создана! ID: ${sessionId}\n🎮 Режим: ${modeNames[gameMode]}\n\n👥 Участники:\nПока никто не присоединился\n\nИспользуйте кнопки ниже или команды /join и /leave`,
+        {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: getSessionKeyboard()
+        }
+      );
+
+      bot.answerCallbackQuery(query.id, { text: `✅ Сессия создана в режиме ${modeNames[gameMode]}` });
+      return;
+    }
     // Просмотр детальной статистики сессии
-    if (data.startsWith('session_details_')) {
+    else if (data.startsWith('session_details_')) {
       const sessionId = parseInt(data.replace('session_details_', ''));
 
       const detailedStats = await generateDetailedSessionStats(sessionId);
@@ -462,11 +495,41 @@ bot.on('callback_query', async (query) => {
       const player1 = gameSession.players.find(p => p.user_id === gameSession.player1Id);
       const player2 = gameSession.players.find(p => p.user_id === player2Id);
 
-      // Создаем кнопки для выбора счета (все возможные комбинации до 2 побед)
-      const scores = [
-        ['2:0', '2:1'],
-        ['0:2', '1:2']
-      ];
+      // Получаем режим игры из сессии
+      const session = await db.getSessionById(gameSession.sessionId);
+      const gameMode = session.game_mode || 'short';
+
+      // Создаем кнопки для выбора счета в зависимости от режима
+      let scores = [];
+
+      if (gameMode === 'short') {
+        // Короткий матч (до 2 побед в геймах)
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === 'set') {
+        // Классический сет (до 6 геймов)
+        scores = [
+          ['6:0', '6:1', '6:2'],
+          ['6:3', '6:4', '7:5'],
+          ['7:6', '0:6', '1:6'],
+          ['2:6', '3:6', '4:6'],
+          ['5:7', '6:7']
+        ];
+      } else if (gameMode === '2sets') {
+        // Матч из 2 сетов
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === '3sets') {
+        // Матч из 3 сетов (до 2 побед)
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      }
 
       const keyboard = {
         inline_keyboard: scores.map(row =>
@@ -477,8 +540,15 @@ bot.on('callback_query', async (query) => {
         )
       };
 
+      const scoreLabels = {
+        'short': 'геймы',
+        'set': 'геймы',
+        '2sets': 'сеты',
+        '3sets': 'сеты'
+      };
+
       bot.editMessageText(
-        `✅ Первый игрок: ${player1.first_name}\n✅ Второй игрок: ${player2.first_name}\n\n🎯 Выберите счет:`,
+        `✅ Первый игрок: ${player1.first_name}\n✅ Второй игрок: ${player2.first_name}\n\n🎯 Выберите счет (${scoreLabels[gameMode]}):`,
         {
           chat_id: chatId,
           message_id: messageId,
@@ -561,14 +631,23 @@ bot.onText(/\/history/, async (msg) => {
     let historyMessage = '📜 История сессий:\n\n';
     const buttons = [];
 
+    const modeIcons = {
+      'short': '⚡',
+      'set': '🎾',
+      '2sets': '🏆',
+      '3sets': '👑'
+    };
+
     for (const session of sessions) {
       const games = await db.getSessionGames(session.id);
       const players = await db.getSessionPlayers(session.id);
       const date = new Date(session.created_at).toLocaleDateString('ru-RU');
       const status = session.is_active ? '🟢 Активна' : '⚫️ Завершена';
+      const gameMode = session.game_mode || 'short';
+      const modeIcon = modeIcons[gameMode];
 
       historyMessage += `${status} Сессия #${session.id} (${date})\n`;
-      historyMessage += `👥 Игроков: ${players.length} | 🎾 Матчей: ${games.length}\n`;
+      historyMessage += `${modeIcon} Режим: ${gameMode} | 👥 Игроков: ${players.length} | 🎾 Матчей: ${games.length}\n`;
 
       // Добавляем кнопку для просмотра деталей
       buttons.push([{
@@ -594,9 +673,20 @@ bot.onText(/\/history/, async (msg) => {
 async function generateSessionStats(sessionId) {
   const games = await db.getSessionGames(sessionId);
   const players = await db.getSessionPlayers(sessionId);
+  const session = await db.getSessionById(sessionId);
+  const gameMode = session.game_mode || 'short';
+
+  const modeNames = {
+    'short': '⚡ Короткий матч (до 2 побед в геймах)',
+    'set': '🎾 Классический сет (до 6 геймов)',
+    '2sets': '🏆 Матч из 2 сетов',
+    '3sets': '👑 Матч из 3 сетов'
+  };
+
+  const scoreUnit = (gameMode === '2sets' || gameMode === '3sets') ? 'сеты' : 'геймы';
 
   if (games.length === 0) {
-    return '📊 Статистика текущей сессии:\n\nИгр пока не было';
+    return `📊 Статистика текущей сессии:\n🎮 Режим: ${modeNames[gameMode]}\n\nИгр пока не было`;
   }
 
   // Подсчет статистики для каждого игрока
@@ -637,7 +727,7 @@ async function generateSessionStats(sessionId) {
     }
   });
 
-  let statsMessage = '📊 Статистика сессии:\n\n';
+  let statsMessage = `📊 Статистика сессии:\n🎮 Режим: ${modeNames[gameMode]}\n\n`;
 
   // Список игр
   statsMessage += '🎾 Сыгранные матчи:\n';
@@ -657,7 +747,7 @@ async function generateSessionStats(sessionId) {
     const winRate = player.played > 0 ? ((player.wins / player.played) * 100).toFixed(0) : 0;
     statsMessage += `\n${index + 1}. ${player.name}${player.username ? ' (@' + player.username + ')' : ''}\n`;
     statsMessage += `   Побед: ${player.wins} | Поражений: ${player.losses}\n`;
-    statsMessage += `   Геймы: ${player.gamesWon}:${player.gamesLost}\n`;
+    statsMessage += `   ${scoreUnit.charAt(0).toUpperCase() + scoreUnit.slice(1)}: ${player.gamesWon}:${player.gamesLost}\n`;
     statsMessage += `   Процент побед: ${winRate}%\n`;
   });
 
@@ -674,12 +764,24 @@ async function generateDetailedSessionStats(sessionId) {
     return '❌ Сессия не найдена';
   }
 
+  const gameMode = session.game_mode || 'short';
+
+  const modeNames = {
+    'short': '⚡ Короткий матч',
+    'set': '🎾 Классический сет',
+    '2sets': '🏆 Матч из 2 сетов',
+    '3sets': '👑 Матч из 3 сетов'
+  };
+
+  const scoreUnit = (gameMode === '2sets' || gameMode === '3sets') ? 'сетам' : 'геймам';
+
   const date = new Date(session.created_at).toLocaleDateString('ru-RU');
   const time = new Date(session.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   const status = session.is_active ? '🟢 Активна' : '⚫️ Завершена';
 
   let statsMessage = `📊 Детальная статистика сессии #${sessionId}\n`;
-  statsMessage += `${status} | 📅 ${date} ${time}\n\n`;
+  statsMessage += `${status} | 📅 ${date} ${time}\n`;
+  statsMessage += `🎮 Режим: ${modeNames[gameMode]}\n\n`;
 
   if (games.length === 0) {
     statsMessage += 'ℹ️ В этой сессии игр не было';
@@ -747,7 +849,7 @@ async function generateDetailedSessionStats(sessionId) {
 
     statsMessage += `${medal}${player.name}${player.username ? ' (@' + player.username + ')' : ''}\n`;
     statsMessage += `   📊 Побед/Поражений: ${player.wins}/${player.losses}\n`;
-    statsMessage += `   🎾 Счет по геймам: ${player.gamesWon}:${player.gamesLost}\n`;
+    statsMessage += `   🎾 Счет по ${scoreUnit}: ${player.gamesWon}:${player.gamesLost}\n`;
     statsMessage += `   📈 Процент побед: ${winRate}%\n`;
     statsMessage += `   🎯 Сыграно матчей: ${player.played}\n\n`;
   });
