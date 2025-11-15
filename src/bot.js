@@ -12,6 +12,14 @@ if (!token) {
 const bot = new TelegramBot(token, { polling: true });
 const db = new Database();
 
+// ID администратора
+const ADMIN_ID = 175130853;
+
+// Функция проверки админа
+function isAdmin(userId) {
+  return userId === ADMIN_ID;
+}
+
 // Временное хранилище для процесса добавления игры
 const gameCreationSessions = new Map();
 
@@ -35,7 +43,9 @@ console.log('Bot started successfully!');
 // Команда /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const welcomeMessage = `
+  const userId = msg.from.id;
+
+  let welcomeMessage = `
 🎾 Добро пожаловать в бота для учета статистики игр в теннис!
 
 Доступные команды:
@@ -51,7 +61,17 @@ bot.onText(/\/start/, async (msg) => {
 📊 Статистика:
 /stats - Показать статистику текущей сессии
 /history - Показать историю предыдущих сессий
+`;
 
+  if (isAdmin(userId)) {
+    welcomeMessage += `
+🔧 Команды администратора:
+/deletesession - Удалить сессию
+(Редактирование результатов доступно при просмотре детальной статистики сессии)
+`;
+  }
+
+  welcomeMessage += `
 ℹ️ /help - Показать эту справку
   `;
 
@@ -61,7 +81,9 @@ bot.onText(/\/start/, async (msg) => {
 // Команда /help
 bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
-  bot.sendMessage(chatId, `
+  const userId = msg.from.id;
+
+  let helpMessage = `
 🎾 Как использовать бота:
 
 1️⃣ Создайте новую сессию: /newsession
@@ -72,7 +94,18 @@ bot.onText(/\/help/, async (msg) => {
    - Выберите счет
 4️⃣ Просматривайте статистику: /stats
 5️⃣ Завершите сессию: /endsession
-  `);
+`;
+
+  if (isAdmin(userId)) {
+    helpMessage += `
+🔧 Функции администратора:
+- /deletesession - Удалить ненужную сессию
+- При просмотре детальной статистики сессии (/history → выбрать сессию)
+  доступна кнопка "✏️ Редактировать результаты" для изменения или удаления игр
+`;
+  }
+
+  bot.sendMessage(chatId, helpMessage);
 });
 
 // Команда /newsession
@@ -284,18 +317,444 @@ bot.on('callback_query', async (query) => {
 
       const detailedStats = await generateDetailedSessionStats(sessionId);
 
+      // Добавляем кнопку редактирования для админа
+      const buttons = [[{
+        text: '◀️ Назад к списку сессий',
+        callback_data: 'back_to_history'
+      }]];
+
+      if (isAdmin(userId)) {
+        buttons.push([{
+          text: '✏️ Редактировать результаты',
+          callback_data: `edit_session_${sessionId}`
+        }]);
+      }
+
       bot.editMessageText(detailedStats, {
         chat_id: chatId,
         message_id: messageId,
         reply_markup: {
-          inline_keyboard: [[{
-            text: '◀️ Назад к списку сессий',
-            callback_data: 'back_to_history'
-          }]]
+          inline_keyboard: buttons
         }
       });
 
       bot.answerCallbackQuery(query.id);
+      return;
+    }
+    // Удаление сессии (только админ)
+    else if (data.startsWith('delete_session_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const sessionId = parseInt(data.replace('delete_session_', ''));
+
+      try {
+        const result = await db.deleteSession(sessionId);
+
+        if (result.deleted) {
+          bot.editMessageText(`✅ Сессия #${sessionId} успешно удалена`, {
+            chat_id: chatId,
+            message_id: messageId
+          });
+          bot.answerCallbackQuery(query.id, { text: '✅ Сессия удалена' });
+        } else {
+          bot.answerCallbackQuery(query.id, { text: '❌ Сессия не найдена' });
+        }
+      } catch (error) {
+        console.error('Error deleting session:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка при удалении' });
+      }
+      return;
+    }
+    // Редактирование результатов сессии (только админ)
+    else if (data.startsWith('edit_session_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const sessionId = parseInt(data.replace('edit_session_', ''));
+      const games = await db.getSessionGames(sessionId);
+
+      if (games.length === 0) {
+        bot.answerCallbackQuery(query.id, { text: 'ℹ️ В сессии нет игр' });
+        return;
+      }
+
+      let message = '✏️ Выберите игру для редактирования:\n\n';
+      const buttons = [];
+
+      games.forEach((game, index) => {
+        message += `${index + 1}. ${game.player1_name} ${game.player1_score}:${game.player2_score} ${game.player2_name}\n`;
+        buttons.push([{
+          text: `✏️ Игра #${index + 1}: ${game.player1_name} vs ${game.player2_name}`,
+          callback_data: `edit_game_${game.id}`
+        }]);
+      });
+
+      buttons.push([{
+        text: '◀️ Назад',
+        callback_data: `session_details_${sessionId}`
+      }]);
+
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      });
+
+      bot.answerCallbackQuery(query.id);
+      return;
+    }
+    // Редактирование конкретной игры (из /stats)
+    else if (data.startsWith('edit_game_stats_')) {
+      const gameId = parseInt(data.replace('edit_game_stats_', ''));
+      const game = await db.getGameById(gameId);
+
+      if (!game) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Игра не найдена' });
+        return;
+      }
+
+      // Проверяем права на редактирование
+      const canEdit = isAdmin(userId) || (game.seconds_ago && game.seconds_ago < 300);
+
+      if (!canEdit) {
+        bot.answerCallbackQuery(query.id, { text: '⏱ Время для редактирования истекло (доступно 5 минут)' });
+        return;
+      }
+
+      // Получаем режим игры
+      const session = await db.getSessionById(game.session_id);
+      const gameMode = session.game_mode || 'short';
+
+      let message = `✏️ Редактирование игры:\n\n`;
+      message += `${game.player1_name} ${game.player1_score}:${game.player2_score} ${game.player2_name}\n\n`;
+      message += 'Выберите новый счет:';
+
+      // Генерируем варианты счета
+      let scores = [];
+
+      if (gameMode === 'short') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === 'set') {
+        scores = [
+          ['6:0', '6:1', '6:2'],
+          ['6:3', '6:4', '7:5'],
+          ['7:6', '0:6', '1:6'],
+          ['2:6', '3:6', '4:6'],
+          ['5:7', '6:7']
+        ];
+      } else if (gameMode === '2sets' || gameMode === '3sets') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      }
+
+      const buttons = scores.map(row =>
+        row.map(score => ({
+          text: `${game.player1_name} ${score} ${game.player2_name}`,
+          callback_data: `update_score_stats_${gameId}_${score}`
+        }))
+      );
+
+      buttons.push([
+        {
+          text: '🗑️ Удалить эту игру',
+          callback_data: `delete_game_stats_${gameId}`
+        }
+      ]);
+
+      buttons.push([{
+        text: '◀️ Назад к статистике',
+        callback_data: `back_to_stats_${game.session_id}`
+      }]);
+
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      });
+
+      bot.answerCallbackQuery(query.id);
+      return;
+    }
+    // Редактирование конкретной игры (из админского меню)
+    else if (data.startsWith('edit_game_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const gameId = parseInt(data.replace('edit_game_', ''));
+      const game = await db.getGameById(gameId);
+
+      if (!game) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Игра не найдена' });
+        return;
+      }
+
+      // Получаем режим игры
+      const session = await db.getSessionById(game.session_id);
+      const gameMode = session.game_mode || 'short';
+
+      let message = `✏️ Редактирование игры:\n\n`;
+      message += `${game.player1_name} ${game.player1_score}:${game.player2_score} ${game.player2_name}\n\n`;
+      message += 'Выберите новый счет:';
+
+      // Генерируем варианты счета
+      let scores = [];
+
+      if (gameMode === 'short') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === 'set') {
+        scores = [
+          ['6:0', '6:1', '6:2'],
+          ['6:3', '6:4', '7:5'],
+          ['7:6', '0:6', '1:6'],
+          ['2:6', '3:6', '4:6'],
+          ['5:7', '6:7']
+        ];
+      } else if (gameMode === '2sets' || gameMode === '3sets') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      }
+
+      const buttons = scores.map(row =>
+        row.map(score => ({
+          text: `${game.player1_name} ${score} ${game.player2_name}`,
+          callback_data: `update_score_${gameId}_${score}`
+        }))
+      );
+
+      buttons.push([
+        {
+          text: '🗑️ Удалить эту игру',
+          callback_data: `delete_game_${gameId}`
+        }
+      ]);
+
+      buttons.push([{
+        text: '◀️ Назад',
+        callback_data: `edit_session_${game.session_id}`
+      }]);
+
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      });
+
+      bot.answerCallbackQuery(query.id);
+      return;
+    }
+    // Обновление счета игры (из /stats)
+    else if (data.startsWith('update_score_stats_')) {
+      const parts = data.replace('update_score_stats_', '').split('_');
+      const gameId = parseInt(parts[0]);
+      const scoreStr = parts[1];
+      const [score1, score2] = scoreStr.split(':').map(s => parseInt(s));
+
+      try {
+        const game = await db.getGameById(gameId);
+
+        // Проверяем права на редактирование
+        const canEdit = isAdmin(userId) || (game.seconds_ago && game.seconds_ago < 300);
+
+        if (!canEdit) {
+          bot.answerCallbackQuery(query.id, { text: '⏱ Время для редактирования истекло' });
+          return;
+        }
+
+        await db.updateGameScore(gameId, score1, score2);
+        const updatedGame = await db.getGameById(gameId);
+
+        bot.editMessageText(
+          `✅ Счет обновлен!\n\n${updatedGame.player1_name} ${score1}:${score2} ${updatedGame.player2_name}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[{
+                text: '◀️ Назад к статистике',
+                callback_data: `back_to_stats_${updatedGame.session_id}`
+              }]]
+            }
+          }
+        );
+
+        bot.answerCallbackQuery(query.id, { text: '✅ Счет обновлен' });
+      } catch (error) {
+        console.error('Error updating score:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка при обновлении' });
+      }
+      return;
+    }
+    // Обновление счета игры (из админского меню)
+    else if (data.startsWith('update_score_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const parts = data.replace('update_score_', '').split('_');
+      const gameId = parseInt(parts[0]);
+      const scoreStr = parts[1];
+      const [score1, score2] = scoreStr.split(':').map(s => parseInt(s));
+
+      try {
+        await db.updateGameScore(gameId, score1, score2);
+        const game = await db.getGameById(gameId);
+
+        bot.editMessageText(
+          `✅ Счет обновлен!\n\n${game.player1_name} ${score1}:${score2} ${game.player2_name}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[{
+                text: '◀️ Назад к списку игр',
+                callback_data: `edit_session_${game.session_id}`
+              }]]
+            }
+          }
+        );
+
+        bot.answerCallbackQuery(query.id, { text: '✅ Счет обновлен' });
+      } catch (error) {
+        console.error('Error updating score:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка при обновлении' });
+      }
+      return;
+    }
+    // Удаление игры (из /stats)
+    else if (data.startsWith('delete_game_stats_')) {
+      const gameId = parseInt(data.replace('delete_game_stats_', ''));
+
+      try {
+        const game = await db.getGameById(gameId);
+        const sessionId = game.session_id;
+
+        // Проверяем права на редактирование
+        const canEdit = isAdmin(userId) || (game.seconds_ago && game.seconds_ago < 300);
+
+        if (!canEdit) {
+          bot.answerCallbackQuery(query.id, { text: '⏱ Время для редактирования истекло' });
+          return;
+        }
+
+        await db.deleteGame(gameId);
+
+        bot.editMessageText(
+          `✅ Игра удалена!\n\n${game.player1_name} ${game.player1_score}:${game.player2_score} ${game.player2_name}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[{
+                text: '◀️ Назад к статистике',
+                callback_data: `back_to_stats_${sessionId}`
+              }]]
+            }
+          }
+        );
+
+        bot.answerCallbackQuery(query.id, { text: '✅ Игра удалена' });
+      } catch (error) {
+        console.error('Error deleting game:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка при удалении' });
+      }
+      return;
+    }
+    // Удаление игры (из админского меню)
+    else if (data.startsWith('delete_game_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const gameId = parseInt(data.replace('delete_game_', ''));
+
+      try {
+        const game = await db.getGameById(gameId);
+        const sessionId = game.session_id;
+
+        await db.deleteGame(gameId);
+
+        bot.editMessageText(
+          `✅ Игра удалена!\n\n${game.player1_name} ${game.player1_score}:${game.player2_score} ${game.player2_name}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[{
+                text: '◀️ Назад к списку игр',
+                callback_data: `edit_session_${sessionId}`
+              }]]
+            }
+          }
+        );
+
+        bot.answerCallbackQuery(query.id, { text: '✅ Игра удалена' });
+      } catch (error) {
+        console.error('Error deleting game:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка при удалении' });
+      }
+      return;
+    }
+    // Возврат к статистике
+    else if (data.startsWith('back_to_stats_')) {
+      const sessionId = parseInt(data.replace('back_to_stats_', ''));
+
+      try {
+        const statsMessage = await generateSessionStats(sessionId);
+        const games = await db.getSessionGames(sessionId);
+
+        // Формируем кнопки редактирования для доступных игр
+        const editButtons = [];
+
+        games.forEach((game, index) => {
+          const canEdit = isAdmin(userId) || (game.seconds_ago && game.seconds_ago < 300);
+
+          if (canEdit) {
+            const timeLeft = game.seconds_ago < 300 ? ` (${Math.floor((300 - game.seconds_ago) / 60)}м ${Math.floor((300 - game.seconds_ago) % 60)}с)` : '';
+            editButtons.push([{
+              text: `✏️ Игра #${index + 1}: ${game.player1_name} vs ${game.player2_name}${!isAdmin(userId) ? timeLeft : ''}`,
+              callback_data: `edit_game_stats_${game.id}`
+            }]);
+          }
+        });
+
+        bot.editMessageText(statsMessage, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: editButtons.length > 0 ? {
+            inline_keyboard: editButtons
+          } : undefined
+        });
+
+        bot.answerCallbackQuery(query.id);
+      } catch (error) {
+        console.error('Error returning to stats:', error);
+        bot.answerCallbackQuery(query.id, { text: '❌ Ошибка' });
+      }
       return;
     }
     // Присоединение к сессии через кнопку
@@ -599,6 +1058,7 @@ bot.on('callback_query', async (query) => {
 // Команда /stats
 bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
   try {
     const activeSession = await db.getActiveSession(chatId);
@@ -609,10 +1069,85 @@ bot.onText(/\/stats/, async (msg) => {
     }
 
     const statsMessage = await generateSessionStats(activeSession.id);
-    bot.sendMessage(chatId, statsMessage);
+    const games = await db.getSessionGames(activeSession.id);
+
+    // Формируем кнопки редактирования для доступных игр
+    const editButtons = [];
+
+    games.forEach((game, index) => {
+      // Показываем кнопку редактирования если:
+      // 1. Пользователь - админ ИЛИ
+      // 2. Игра была добавлена менее 5 минут назад (300 секунд)
+      const canEdit = isAdmin(userId) || (game.seconds_ago && game.seconds_ago < 300);
+
+      if (canEdit) {
+        const timeLeft = game.seconds_ago < 300 ? ` (${Math.floor((300 - game.seconds_ago) / 60)}м ${Math.floor((300 - game.seconds_ago) % 60)}с)` : '';
+        editButtons.push([{
+          text: `✏️ Игра #${index + 1}: ${game.player1_name} vs ${game.player2_name}${!isAdmin(userId) ? timeLeft : ''}`,
+          callback_data: `edit_game_stats_${game.id}`
+        }]);
+      }
+    });
+
+    if (editButtons.length > 0) {
+      bot.sendMessage(chatId, statsMessage, {
+        reply_markup: {
+          inline_keyboard: editButtons
+        }
+      });
+    } else {
+      bot.sendMessage(chatId, statsMessage);
+    }
   } catch (error) {
     console.error('Error getting stats:', error);
     bot.sendMessage(chatId, '❌ Ошибка при получении статистики');
+  }
+});
+
+// Команда /deletesession - только для админа
+bot.onText(/\/deletesession/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, '❌ Эта команда доступна только администратору');
+    return;
+  }
+
+  try {
+    const sessions = await db.getChatSessions(chatId, 10);
+
+    if (sessions.length === 0) {
+      bot.sendMessage(chatId, 'ℹ️ История сессий пуста');
+      return;
+    }
+
+    let message = '🗑️ Выберите сессию для удаления:\n\n';
+    const buttons = [];
+
+    for (const session of sessions) {
+      const games = await db.getSessionGames(session.id);
+      const players = await db.getSessionPlayers(session.id);
+      const date = new Date(session.created_at).toLocaleDateString('ru-RU');
+      const status = session.is_active ? '🟢 Активна' : '⚫️ Завершена';
+
+      message += `${status} Сессия #${session.id} (${date})\n`;
+      message += `👥 Игроков: ${players.length} | 🎾 Матчей: ${games.length}\n\n`;
+
+      buttons.push([{
+        text: `🗑️ Удалить сессию #${session.id}`,
+        callback_data: `delete_session_${session.id}`
+      }]);
+    }
+
+    const keyboard = {
+      inline_keyboard: buttons
+    };
+
+    bot.sendMessage(chatId, message, { reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error in deletesession command:', error);
+    bot.sendMessage(chatId, '❌ Ошибка при получении списка сессий');
   }
 });
 

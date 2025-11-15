@@ -1,6 +1,6 @@
 {
   "name": "tennis-stats-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Telegram bot for tracking tennis game statistics",
   "main": "src/bot.js",
   "scripts": {

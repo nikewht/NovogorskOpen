@@ -213,7 +213,8 @@ class Database {
       this.db.all(
         `SELECT g.*,
                 p1.first_name as player1_name, p1.username as player1_username,
-                p2.first_name as player2_name, p2.username as player2_username
+                p2.first_name as player2_name, p2.username as player2_username,
+                (strftime('%s', 'now') - strftime('%s', g.created_at)) as seconds_ago
          FROM games g
          LEFT JOIN session_players p1 ON g.player1_id = p1.user_id AND g.session_id = p1.session_id
          LEFT JOIN session_players p2 ON g.player2_id = p2.user_id AND g.session_id = p2.session_id
@@ -237,6 +238,99 @@ class Database {
         (err, rows) => {
           if (err) reject(err);
           else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Удалить сессию (только для админа)
+  deleteSession(sessionId) {
+    return new Promise((resolve, reject) => {
+      this.db.serialize(() => {
+        // Удаляем все игры сессии
+        this.db.run('DELETE FROM games WHERE session_id = ?', [sessionId], (err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          // Удаляем всех игроков сессии
+          this.db.run('DELETE FROM session_players WHERE session_id = ?', [sessionId], (err) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+
+            // Удаляем саму сессию
+            this.db.run('DELETE FROM sessions WHERE id = ?', [sessionId], function(err) {
+              if (err) reject(err);
+              else resolve({ deleted: this.changes > 0 });
+            });
+          });
+        });
+      });
+    });
+  }
+
+  // Получить игру по ID
+  getGameById(gameId) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT g.*,
+                p1.first_name as player1_name, p1.username as player1_username,
+                p2.first_name as player2_name, p2.username as player2_username,
+                (strftime('%s', 'now') - strftime('%s', g.created_at)) as seconds_ago
+         FROM games g
+         LEFT JOIN session_players p1 ON g.player1_id = p1.user_id AND g.session_id = p1.session_id
+         LEFT JOIN session_players p2 ON g.player2_id = p2.user_id AND g.session_id = p2.session_id
+         WHERE g.id = ?`,
+        [gameId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        }
+      );
+    });
+  }
+
+  // Проверить, можно ли редактировать игру (менее 5 минут назад)
+  canEditGame(gameId) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT (strftime('%s', 'now') - strftime('%s', created_at)) as seconds_ago
+         FROM games WHERE id = ?`,
+        [gameId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row && row.seconds_ago < 300); // 300 секунд = 5 минут
+        }
+      );
+    });
+  }
+
+  // Обновить счет игры
+  updateGameScore(gameId, player1Score, player2Score) {
+    return new Promise((resolve, reject) => {
+      this.db.run(
+        'UPDATE games SET player1_score = ?, player2_score = ? WHERE id = ?',
+        [player1Score, player2Score, gameId],
+        function(err) {
+          if (err) reject(err);
+          else resolve({ updated: this.changes > 0 });
+        }
+      );
+    });
+  }
+
+  // Удалить игру
+  deleteGame(gameId) {
+    return new Promise((resolve, reject) => {
+      this.db.run(
+        'DELETE FROM games WHERE id = ?',
+        [gameId],
+        function(err) {
+          if (err) reject(err);
+          else resolve({ deleted: this.changes > 0 });
         }
       );
     });
