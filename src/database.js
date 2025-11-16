@@ -79,6 +79,24 @@ class Database {
           FOREIGN KEY (session_id) REFERENCES sessions (id)
         )
       `);
+
+      // Таблица месячных отчетов
+      this.db.run(`
+        CREATE TABLE IF NOT EXISTS monthly_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id INTEGER NOT NULL,
+          year INTEGER NOT NULL,
+          month INTEGER NOT NULL,
+          stats_json TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(chat_id, year, month)
+        )
+      `);
+
+      // Создаем индексы для оптимизации запросов
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(chat_id, created_at)`);
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_closed_at ON sessions(chat_id, closed_at)`);
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_monthly_reports_period ON monthly_reports(chat_id, year, month)`);
     });
   }
 
@@ -331,6 +349,157 @@ class Database {
         function(err) {
           if (err) reject(err);
           else resolve({ deleted: this.changes > 0 });
+        }
+      );
+    });
+  }
+
+  // Получить сессии за период
+  getSessionsByPeriod(chatId, startDate, endDate) {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT * FROM sessions
+         WHERE chat_id = ?
+         AND created_at >= ?
+         AND created_at <= ?
+         ORDER BY created_at DESC`,
+        [chatId, startDate, endDate],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Получить все игры за период
+  getGamesByPeriod(chatId, startDate, endDate) {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT g.*, s.chat_id,
+                p1.first_name as player1_name, p1.username as player1_username,
+                p2.first_name as player2_name, p2.username as player2_username
+         FROM games g
+         JOIN sessions s ON g.session_id = s.id
+         LEFT JOIN session_players p1 ON g.player1_id = p1.user_id AND g.session_id = p1.session_id
+         LEFT JOIN session_players p2 ON g.player2_id = p2.user_id AND g.session_id = p2.session_id
+         WHERE s.chat_id = ?
+         AND g.created_at >= ?
+         AND g.created_at <= ?
+         ORDER BY g.created_at`,
+        [chatId, startDate, endDate],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Получить все игры для чата (без ограничений по периоду)
+  getAllChatGames(chatId) {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT g.*, s.chat_id, s.game_mode,
+                p1.first_name as player1_name, p1.username as player1_username,
+                p2.first_name as player2_name, p2.username as player2_username
+         FROM games g
+         JOIN sessions s ON g.session_id = s.id
+         LEFT JOIN session_players p1 ON g.player1_id = p1.user_id AND g.session_id = p1.session_id
+         LEFT JOIN session_players p2 ON g.player2_id = p2.user_id AND g.session_id = p2.session_id
+         WHERE s.chat_id = ?
+         ORDER BY g.created_at`,
+        [chatId],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Получить всех уникальных игроков для чата
+  getAllChatPlayers(chatId) {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT DISTINCT user_id, username, first_name
+         FROM session_players sp
+         JOIN sessions s ON sp.session_id = s.id
+         WHERE s.chat_id = ?
+         ORDER BY first_name`,
+        [chatId],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Сохранить месячный отчет
+  saveMonthlyReport(chatId, year, month, statsJson) {
+    return new Promise((resolve, reject) => {
+      const stats = typeof statsJson === 'string' ? statsJson : JSON.stringify(statsJson);
+      this.db.run(
+        `INSERT OR REPLACE INTO monthly_reports (chat_id, year, month, stats_json, created_at)
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        [chatId, year, month, stats],
+        function(err) {
+          if (err) reject(err);
+          else resolve(this.lastID);
+        }
+      );
+    });
+  }
+
+  // Получить месячный отчет
+  getMonthlyReport(chatId, year, month) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT * FROM monthly_reports
+         WHERE chat_id = ? AND year = ? AND month = ?`,
+        [chatId, year, month],
+        (err, row) => {
+          if (err) reject(err);
+          else {
+            if (row && row.stats_json) {
+              row.stats = JSON.parse(row.stats_json);
+            }
+            resolve(row);
+          }
+        }
+      );
+    });
+  }
+
+  // Получить все месячные отчеты для чата
+  getMonthlyReports(chatId, limit = 12) {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT id, chat_id, year, month, created_at
+         FROM monthly_reports
+         WHERE chat_id = ?
+         ORDER BY year DESC, month DESC
+         LIMIT ?`,
+        [chatId, limit],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  // Проверить, существует ли месячный отчет
+  hasMonthlyReport(chatId, year, month) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT COUNT(*) as count FROM monthly_reports
+         WHERE chat_id = ? AND year = ? AND month = ?`,
+        [chatId, year, month],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row.count > 0);
         }
       );
     });

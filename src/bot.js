@@ -1,6 +1,15 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const Database = require('./database');
+const {
+  calculatePlayerStats,
+  calculateAchievements,
+  generateActivityChart,
+  generateMonthlyActivityChart,
+  formatPlayerRanking,
+  formatAchievements,
+  generateMonthlyStatsData
+} = require('./stats-utils');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -40,6 +49,97 @@ function getSessionKeyboard() {
 
 console.log('Bot started successfully!');
 
+// Автоматическая фиксация месячных отчетов
+let lastCheckedDate = null;
+
+async function checkAndCreateMonthlyReports() {
+  const now = new Date();
+  const currentDate = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+
+  // Проверяем только раз в день
+  if (lastCheckedDate === currentDate) {
+    return;
+  }
+
+  lastCheckedDate = currentDate;
+
+  // Если сегодня 1-е число, создаем отчет за прошлый месяц
+  if (now.getDate() === 1) {
+    try {
+      console.log('Проверка создания месячных отчетов...');
+
+      // Получаем прошлый месяц
+      const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const year = prevMonth.getFullYear();
+      const month = prevMonth.getMonth() + 1;
+
+      // Получаем все уникальные чаты из базы
+      const allSessions = await new Promise((resolve, reject) => {
+        db.db.all('SELECT DISTINCT chat_id FROM sessions', (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        });
+      });
+
+      console.log(`Найдено ${allSessions.length} уникальных чатов`);
+
+      for (const session of allSessions) {
+        const chatId = session.chat_id;
+
+        // Проверяем, не создан ли уже отчет
+        const hasReport = await db.hasMonthlyReport(chatId, year, month);
+        if (hasReport) {
+          console.log(`Отчет для чата ${chatId} за ${month}/${year} уже существует`);
+          continue;
+        }
+
+        // Получаем данные за прошлый месяц
+        const startDate = new Date(year, month - 1, 1);
+        const endDate = new Date(year, month, 0, 23, 59, 59);
+
+        const games = await db.getGamesByPeriod(chatId, startDate.toISOString(), endDate.toISOString());
+
+        if (games.length === 0) {
+          console.log(`Нет игр для чата ${chatId} за ${month}/${year}`);
+          continue;
+        }
+
+        const players = await db.getAllChatPlayers(chatId);
+        const statsData = generateMonthlyStatsData(games, players, year, month);
+
+        // Сохраняем отчет
+        await db.saveMonthlyReport(chatId, year, month, statsData);
+
+        console.log(`Создан месячный отчет для чата ${chatId} за ${month}/${year} (${games.length} игр)`);
+
+        // Отправляем уведомление в чат
+        const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+          'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+        const notification = `📊 ИТОГИ ${monthNames[month - 1].toUpperCase()} ${year}\n\n` +
+          `Автоматически создан месячный отчет!\n\n` +
+          `🎾 Матчей: ${statsData.totalGames}\n` +
+          `👥 Игроков: ${statsData.totalPlayers}\n\n` +
+          `Используйте /monthstats ${year} ${month} для просмотра`;
+
+        try {
+          await bot.sendMessage(chatId, notification);
+        } catch (error) {
+          console.error(`Ошибка отправки уведомления в чат ${chatId}:`, error.message);
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка при создании месячных отчетов:', error);
+    }
+  }
+}
+
+// Проверяем раз в час
+setInterval(checkAndCreateMonthlyReports, 60 * 60 * 1000);
+
+// Проверяем сразу при старте (с задержкой 5 секунд)
+setTimeout(checkAndCreateMonthlyReports, 5000);
+
 // Команда /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
@@ -61,6 +161,9 @@ bot.onText(/\/start/, async (msg) => {
 📊 Статистика:
 /stats - Показать статистику текущей сессии
 /history - Показать историю предыдущих сессий
+/allstats - Общая статистика за все время
+/monthstats - Статистика за месяц (текущий или указанный)
+/reports - Архив месячных отчетов
 `;
 
   if (isAdmin(userId)) {
@@ -1404,6 +1507,393 @@ async function generateDetailedSessionStats(sessionId) {
 
   return statsMessage;
 }
+
+// Команда /allstats - общая статистика за все время
+bot.onText(/\/allstats/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  try {
+    const games = await db.getAllChatGames(chatId);
+    const players = await db.getAllChatPlayers(chatId);
+
+    if (games.length === 0) {
+      bot.sendMessage(chatId, '📊 Статистика недоступна. Пока не сыграно ни одной игры.');
+      return;
+    }
+
+    const playerStats = calculatePlayerStats(games, players);
+    const achievements = calculateAchievements(playerStats, games);
+
+    // Формируем сообщение
+    let message = '📊 ОБЩАЯ СТАТИСТИКА ЗА ВСЕ ВРЕМЯ\n\n';
+    message += `🎾 Всего матчей: ${games.length}\n`;
+    message += `👥 Всего игроков: ${Object.values(playerStats).filter(p => p.played > 0).length}\n\n`;
+
+    // Рейтинг игроков
+    message += formatPlayerRanking(playerStats, {
+      title: '🏆 Общий рейтинг игроков',
+      showMedals: true,
+      minGames: 1,
+      maxPlayers: 10,
+      scoreUnit: 'очков'
+    });
+
+    // Кнопки для фильтрации
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '📅 По месяцам', callback_data: 'allstats_monthly' },
+          { text: '🏅 Достижения', callback_data: 'allstats_achievements' }
+        ],
+        [
+          { text: '📊 График активности', callback_data: 'allstats_activity' }
+        ]
+      ]
+    };
+
+    await bot.sendMessage(chatId, message, { reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error in /allstats:', error);
+    bot.sendMessage(chatId, '❌ Ошибка при формировании статистики');
+  }
+});
+
+// Обработчик для кнопок общей статистики
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  if (data === 'allstats_achievements') {
+    try {
+      const games = await db.getAllChatGames(chatId);
+      const players = await db.getAllChatPlayers(chatId);
+
+      if (games.length === 0) {
+        bot.answerCallbackQuery(query.id, { text: 'Недостаточно данных' });
+        return;
+      }
+
+      const playerStats = calculatePlayerStats(games, players);
+      const achievements = calculateAchievements(playerStats, games);
+
+      const message = formatAchievements(achievements, games);
+
+      await bot.sendMessage(chatId, message);
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing achievements:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка при формировании достижений' });
+    }
+  } else if (data === 'allstats_activity') {
+    try {
+      const games = await db.getAllChatGames(chatId);
+
+      if (games.length === 0) {
+        bot.answerCallbackQuery(query.id, { text: 'Недостаточно данных' });
+        return;
+      }
+
+      // Определяем период (от первой игры до последней)
+      const firstGame = new Date(games[0].created_at);
+      const lastGame = new Date(games[games.length - 1].created_at);
+
+      const chart = generateActivityChart(games, firstGame, lastGame);
+      const message = `📊 ГРАФИК АКТИВНОСТИ\n\nПериод: ${firstGame.toLocaleDateString('ru-RU')} - ${lastGame.toLocaleDateString('ru-RU')}\n\n${chart}`;
+
+      await bot.sendMessage(chatId, message);
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing activity:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка при формировании графика' });
+    }
+  } else if (data === 'allstats_monthly') {
+    try {
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: '📅 Текущий месяц', callback_data: 'monthstats_current' },
+            { text: '📅 Прошлый месяц', callback_data: 'monthstats_previous' }
+          ],
+          [
+            { text: '📋 Архив отчетов', callback_data: 'reports_list' }
+          ]
+        ]
+      };
+
+      await bot.sendMessage(chatId, 'Выберите период для просмотра:', { reply_markup: keyboard });
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing monthly options:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка' });
+    }
+  }
+});
+
+// Команда /monthstats - статистика за месяц
+bot.onText(/\/monthstats(?:\s+(\d{4})\s+(\d{1,2}))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+
+  try {
+    // Определяем год и месяц
+    const now = new Date();
+    const year = match[1] ? parseInt(match[1]) : now.getFullYear();
+    const month = match[2] ? parseInt(match[2]) : now.getMonth() + 1;
+
+    await showMonthStats(chatId, year, month);
+  } catch (error) {
+    console.error('Error in /monthstats:', error);
+    bot.sendMessage(chatId, '❌ Ошибка при формировании месячной статистики');
+  }
+});
+
+// Вспомогательная функция для показа месячной статистики
+async function showMonthStats(chatId, year, month) {
+  const monthNames = [
+    'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'
+  ];
+
+  // Сначала проверяем, есть ли сохраненный отчет
+  const savedReport = await db.getMonthlyReport(chatId, year, month);
+
+  if (savedReport) {
+    // Показываем сохраненный отчет
+    const stats = savedReport.stats;
+    let message = `📊 СТАТИСТИКА ЗА ${monthNames[month - 1].toUpperCase()} ${year}\n`;
+    message += `💾 Сохраненный отчет от ${new Date(savedReport.created_at).toLocaleDateString('ru-RU')}\n\n`;
+    message += `🎾 Всего матчей: ${stats.totalGames}\n`;
+    message += `👥 Всего игроков: ${stats.totalPlayers}\n\n`;
+
+    message += formatPlayerRanking(
+      stats.playerStats.reduce((acc, p) => ({ ...acc, [p.user_id]: p }), {}),
+      {
+        title: '🏆 Рейтинг месяца',
+        showMedals: true,
+        minGames: 1,
+        maxPlayers: 10,
+        scoreUnit: 'очков'
+      }
+    );
+
+    if (stats.achievements) {
+      message += '\n' + formatAchievements(stats.achievements, []);
+    }
+
+    await bot.sendMessage(chatId, message);
+    return;
+  }
+
+  // Если нет сохраненного отчета, генерируем в реальном времени
+  const startDate = new Date(year, month - 1, 1);
+  const endDate = new Date(year, month, 0, 23, 59, 59);
+
+  const games = await db.getGamesByPeriod(chatId, startDate.toISOString(), endDate.toISOString());
+  const players = await db.getAllChatPlayers(chatId);
+
+  if (games.length === 0) {
+    bot.sendMessage(chatId, `📊 За ${monthNames[month - 1]} ${year} не было сыграно ни одной игры.`);
+    return;
+  }
+
+  const playerStats = calculatePlayerStats(games, players);
+  const achievements = calculateAchievements(playerStats, games);
+
+  let message = `📊 СТАТИСТИКА ЗА ${monthNames[month - 1].toUpperCase()} ${year}\n\n`;
+  message += `🎾 Всего матчей: ${games.length}\n`;
+  message += `👥 Всего игроков: ${Object.values(playerStats).filter(p => p.played > 0).length}\n\n`;
+
+  message += formatPlayerRanking(playerStats, {
+    title: '🏆 Рейтинг месяца',
+    showMedals: true,
+    minGames: 1,
+    maxPlayers: 10,
+    scoreUnit: 'очков'
+  });
+
+  // Кнопки
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '🏅 Достижения месяца', callback_data: `month_achievements_${year}_${month}` }
+      ],
+      [
+        { text: '📊 График активности', callback_data: `month_activity_${year}_${month}` }
+      ],
+      [
+        { text: '◀️ Пред. месяц', callback_data: `monthstats_${year}_${month - 1}` },
+        { text: 'След. месяц ▶️', callback_data: `monthstats_${year}_${month + 1}` }
+      ]
+    ]
+  };
+
+  await bot.sendMessage(chatId, message, { reply_markup: keyboard });
+}
+
+// Обработчики для месячной статистики
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  if (data === 'monthstats_current') {
+    const now = new Date();
+    await showMonthStats(chatId, now.getFullYear(), now.getMonth() + 1);
+    bot.answerCallbackQuery(query.id);
+  } else if (data === 'monthstats_previous') {
+    const now = new Date();
+    const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    await showMonthStats(chatId, prevMonth.getFullYear(), prevMonth.getMonth() + 1);
+    bot.answerCallbackQuery(query.id);
+  } else if (data.startsWith('monthstats_')) {
+    const parts = data.split('_');
+    const year = parseInt(parts[1]);
+    let month = parseInt(parts[2]);
+
+    // Корректировка месяца
+    if (month < 1) {
+      month = 12;
+      year--;
+    } else if (month > 12) {
+      month = 1;
+      year++;
+    }
+
+    await showMonthStats(chatId, year, month);
+    bot.answerCallbackQuery(query.id);
+  } else if (data.startsWith('month_achievements_')) {
+    try {
+      const parts = data.split('_');
+      const year = parseInt(parts[2]);
+      const month = parseInt(parts[3]);
+
+      const startDate = new Date(year, month - 1, 1);
+      const endDate = new Date(year, month, 0, 23, 59, 59);
+
+      const games = await db.getGamesByPeriod(chatId, startDate.toISOString(), endDate.toISOString());
+      const players = await db.getAllChatPlayers(chatId);
+
+      const playerStats = calculatePlayerStats(games, players);
+      const achievements = calculateAchievements(playerStats, games);
+
+      const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+        'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+      let message = `🏅 ДОСТИЖЕНИЯ ЗА ${monthNames[month - 1].toUpperCase()} ${year}\n\n`;
+      message += formatAchievements(achievements, games);
+
+      await bot.sendMessage(chatId, message);
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing month achievements:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка' });
+    }
+  } else if (data.startsWith('month_activity_')) {
+    try {
+      const parts = data.split('_');
+      const year = parseInt(parts[2]);
+      const month = parseInt(parts[3]);
+
+      const startDate = new Date(year, month - 1, 1);
+      const endDate = new Date(year, month, 0, 23, 59, 59);
+
+      const games = await db.getGamesByPeriod(chatId, startDate.toISOString(), endDate.toISOString());
+
+      const chart = generateMonthlyActivityChart(games, year, month);
+      const monthNames = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+        'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+
+      const message = `📊 АКТИВНОСТЬ ЗА ${monthNames[month - 1].toUpperCase()} ${year}\n\n${chart}\n\nВсего матчей: ${games.length}`;
+
+      await bot.sendMessage(chatId, message);
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing month activity:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка' });
+    }
+  }
+});
+
+// Команда /reports - архив месячных отчетов
+bot.onText(/\/reports/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  try {
+    const reports = await db.getMonthlyReports(chatId, 12);
+
+    if (reports.length === 0) {
+      bot.sendMessage(chatId, '📋 Архив отчетов пуст. Отчеты будут автоматически создаваться в конце каждого месяца.');
+      return;
+    }
+
+    const monthNames = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн',
+      'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+
+    let message = '📋 АРХИВ МЕСЯЧНЫХ ОТЧЕТОВ\n\n';
+
+    const keyboard = {
+      inline_keyboard: []
+    };
+
+    reports.forEach(report => {
+      const monthName = monthNames[report.month - 1];
+      const label = `${monthName} ${report.year}`;
+      message += `📊 ${label} - создан ${new Date(report.created_at).toLocaleDateString('ru-RU')}\n`;
+
+      keyboard.inline_keyboard.push([
+        { text: `📊 ${label}`, callback_data: `view_report_${report.year}_${report.month}` }
+      ]);
+    });
+
+    await bot.sendMessage(chatId, message, { reply_markup: keyboard });
+  } catch (error) {
+    console.error('Error in /reports:', error);
+    bot.sendMessage(chatId, '❌ Ошибка при получении списка отчетов');
+  }
+});
+
+// Обработчик для просмотра сохраненного отчета
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  if (data.startsWith('view_report_')) {
+    try {
+      const parts = data.split('_');
+      const year = parseInt(parts[2]);
+      const month = parseInt(parts[3]);
+
+      await showMonthStats(chatId, year, month);
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error viewing report:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка при загрузке отчета' });
+    }
+  } else if (data === 'reports_list') {
+    try {
+      const reports = await db.getMonthlyReports(chatId, 12);
+
+      if (reports.length === 0) {
+        bot.answerCallbackQuery(query.id, { text: 'Архив отчетов пуст' });
+        return;
+      }
+
+      const monthNames = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн',
+        'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+
+      const keyboard = {
+        inline_keyboard: reports.map(report => [{
+          text: `📊 ${monthNames[report.month - 1]} ${report.year}`,
+          callback_data: `view_report_${report.year}_${report.month}`
+        }])
+      };
+
+      await bot.sendMessage(chatId, '📋 Выберите отчет для просмотра:', { reply_markup: keyboard });
+      bot.answerCallbackQuery(query.id);
+    } catch (error) {
+      console.error('Error showing reports list:', error);
+      bot.answerCallbackQuery(query.id, { text: 'Ошибка' });
+    }
+  }
+});
 
 // Обработка ошибок
 process.on('unhandledRejection', (error) => {
