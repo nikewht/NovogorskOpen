@@ -419,6 +419,7 @@ bot.on('callback_query', async (query) => {
       const sessionId = parseInt(data.replace('session_details_', ''));
 
       const detailedStats = await generateDetailedSessionStats(sessionId);
+      const session = await db.getSessionById(sessionId);
 
       // Добавляем кнопку редактирования для админа
       const buttons = [[{
@@ -431,6 +432,14 @@ bot.on('callback_query', async (query) => {
           text: '✏️ Редактировать результаты',
           callback_data: `edit_session_${sessionId}`
         }]);
+
+        // Добавляем кнопку "Добавить игру" только для завершенных сессий
+        if (session && !session.is_active) {
+          buttons.push([{
+            text: '➕ Добавить игру',
+            callback_data: `add_game_to_closed_${sessionId}`
+          }]);
+        }
       }
 
       bot.editMessageText(detailedStats, {
@@ -439,6 +448,59 @@ bot.on('callback_query', async (query) => {
         reply_markup: {
           inline_keyboard: buttons
         }
+      });
+
+      bot.answerCallbackQuery(query.id);
+      return;
+    }
+    // Добавить игру в завершенную сессию (только админ)
+    else if (data.startsWith('add_game_to_closed_')) {
+      if (!isAdmin(userId)) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Доступно только администратору' });
+        return;
+      }
+
+      const sessionId = parseInt(data.replace('add_game_to_closed_', ''));
+      const session = await db.getSessionById(sessionId);
+
+      if (!session) {
+        bot.answerCallbackQuery(query.id, { text: '❌ Сессия не найдена' });
+        return;
+      }
+
+      const players = await db.getSessionPlayers(sessionId);
+
+      if (players.length < 2) {
+        bot.answerCallbackQuery(query.id, { text: '⚠️ В сессии должно быть минимум 2 игрока' });
+        return;
+      }
+
+      // Создаем кнопки для выбора первого игрока
+      const keyboard = {
+        inline_keyboard: players.map(player => [{
+          text: `${player.first_name}${player.username ? ' (@' + player.username + ')' : ''}`,
+          callback_data: `select_p1_closed_${sessionId}_${player.user_id}`
+        }])
+      };
+
+      // Добавляем кнопку "Назад"
+      keyboard.inline_keyboard.push([{
+        text: '◀️ Назад',
+        callback_data: `session_details_${sessionId}`
+      }]);
+
+      // Инициализируем сессию добавления игры
+      gameCreationSessions.set(`${chatId}_${userId}`, {
+        sessionId: sessionId,
+        players: players,
+        step: 'select_player1',
+        closedSession: true // Флаг, что это завершенная сессия
+      });
+
+      bot.editMessageText('🎾 Выберите первого игрока:', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: keyboard
       });
 
       bot.answerCallbackQuery(query.id);
@@ -1133,24 +1195,160 @@ bot.on('callback_query', async (query) => {
 
       const winner = score1 > score2 ? player1.first_name : player2.first_name;
 
-      bot.editMessageText(
-        `✅ Результат записан!\n\n🎾 ${player1.first_name} ${score1}:${score2} ${player2.first_name}\n🏆 Победитель: ${winner}`,
-        {
-          chat_id: chatId,
-          message_id: messageId,
-          reply_markup: {
-            inline_keyboard: [[{
-              text: '🎾 Добавить еще один результат',
-              callback_data: 'add_game_button'
-            }]]
+      // Проверяем, была ли это завершенная сессия
+      if (gameSession.closedSession) {
+        // Для завершенной сессии показываем кнопку "Назад к сессии"
+        bot.editMessageText(
+          `✅ Результат записан в завершенную сессию!\n\n🎾 ${player1.first_name} ${score1}:${score2} ${player2.first_name}\n🏆 Победитель: ${winner}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[
+                {
+                  text: '➕ Добавить еще один результат',
+                  callback_data: `add_game_to_closed_${gameSession.sessionId}`
+                },
+                {
+                  text: '◀️ Назад к сессии',
+                  callback_data: `session_details_${gameSession.sessionId}`
+                }
+              ]]
+            }
           }
-        }
-      );
+        );
+      } else {
+        // Для активной сессии оставляем старое поведение
+        bot.editMessageText(
+          `✅ Результат записан!\n\n🎾 ${player1.first_name} ${score1}:${score2} ${player2.first_name}\n🏆 Победитель: ${winner}`,
+          {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [[{
+                text: '🎾 Добавить еще один результат',
+                callback_data: 'add_game_button'
+              }]]
+            }
+          }
+        );
+      }
 
       bot.answerCallbackQuery(query.id, { text: '✅ Результат сохранен!' });
 
       // Удаляем сессию
       gameCreationSessions.delete(sessionKey);
+    }
+    // Выбор первого игрока для завершенной сессии
+    else if (data.startsWith('select_p1_closed_')) {
+      // Формат: select_p1_closed_${sessionId}_${player.user_id}
+      const parts = data.replace('select_p1_closed_', '').split('_');
+      const sessionId = parseInt(parts[0]);
+      const player1Id = parseInt(parts[1]);
+
+      gameSession.player1Id = player1Id;
+      gameSession.step = 'select_player2';
+
+      const player1 = gameSession.players.find(p => p.user_id === player1Id);
+
+      // Создаем кнопки для выбора второго игрока (исключая первого)
+      const keyboard = {
+        inline_keyboard: gameSession.players
+          .filter(p => p.user_id !== player1Id)
+          .map(player => [{
+            text: `${player.first_name}${player.username ? ' (@' + player.username + ')' : ''}`,
+            callback_data: `select_p2_closed_${sessionId}_${player.user_id}`
+          }])
+      };
+
+      // Добавляем кнопку "Назад"
+      keyboard.inline_keyboard.push([{
+        text: '◀️ Назад',
+        callback_data: `add_game_to_closed_${sessionId}`
+      }]);
+
+      bot.editMessageText(
+        `✅ Первый игрок: ${player1.first_name}\n\n🎾 Выберите второго игрока:`,
+        {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: keyboard
+        }
+      );
+
+      bot.answerCallbackQuery(query.id);
+    }
+    // Выбор второго игрока для завершенной сессии
+    else if (data.startsWith('select_p2_closed_')) {
+      // Формат: select_p2_closed_${sessionId}_${player.user_id}
+      const parts = data.replace('select_p2_closed_', '').split('_');
+      const sessionId = parseInt(parts[0]);
+      const player2Id = parseInt(parts[1]);
+
+      gameSession.player2Id = player2Id;
+      gameSession.step = 'select_score';
+
+      const player1 = gameSession.players.find(p => p.user_id === gameSession.player1Id);
+      const player2 = gameSession.players.find(p => p.user_id === player2Id);
+
+      // Получаем режим игры из сессии
+      const session = await db.getSessionById(gameSession.sessionId);
+      const gameMode = session.game_mode || 'short';
+
+      // Создаем кнопки для выбора счета в зависимости от режима
+      let scores = [];
+
+      if (gameMode === 'short') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === 'set') {
+        scores = [
+          ['6:0', '6:1', '6:2'],
+          ['6:3', '6:4', '7:5'],
+          ['7:6', '0:6', '1:6'],
+          ['2:6', '3:6', '4:6'],
+          ['5:7', '6:7']
+        ];
+      } else if (gameMode === '2sets') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      } else if (gameMode === '3sets') {
+        scores = [
+          ['2:0', '2:1'],
+          ['0:2', '1:2']
+        ];
+      }
+
+      const keyboard = {
+        inline_keyboard: scores.map(row =>
+          row.map(score => ({
+            text: `${player1.first_name} ${score} ${player2.first_name}`,
+            callback_data: `score_${score}`
+          }))
+        )
+      };
+
+      const scoreLabels = {
+        'short': 'геймы',
+        'set': 'геймы',
+        '2sets': 'сеты',
+        '3sets': 'сеты'
+      };
+
+      bot.editMessageText(
+        `✅ Первый игрок: ${player1.first_name}\n✅ Второй игрок: ${player2.first_name}\n\n🎯 Выберите счет (${scoreLabels[gameMode]}):`,
+        {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: keyboard
+        }
+      );
+
+      bot.answerCallbackQuery(query.id);
     }
   } catch (error) {
     console.error('Error handling callback:', error);
